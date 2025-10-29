@@ -1,14 +1,23 @@
 from typing import Dict, Tuple, Union
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
+import numpy as np
+import einops
 from jaxtyping import Float
+
+from transformers.utils import is_bitsandbytes_available
 
 from transformer_lens.components import AbstractAttention
 from transformer_lens.components.rms_norm import RMSNorm
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
-from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear
+from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear, complex_attn_linear_4bit, simple_attn_linear_4bit
 
+if is_bitsandbytes_available():
+    import bitsandbytes as bnb
+    import bitsandbytes.functional as Fb
+    from bitsandbytes.nn.modules import Params4bit, QuantState
 
 class GroupedQueryAttention(AbstractAttention):
     def __init__(
@@ -32,22 +41,28 @@ class GroupedQueryAttention(AbstractAttention):
         assert cfg.n_key_value_heads is not None
         super().__init__(cfg, attn_type, layer_id)
         self.repeat_kv_heads = cfg.n_heads // cfg.n_key_value_heads
-        self._W_K = nn.Parameter(
-            torch.empty(
-                cfg.n_key_value_heads,
-                self.cfg.d_model,
-                self.cfg.d_head,
-                dtype=cfg.dtype,
+        if self.cfg.load_in_4bit:
+            # 4-bit quantization convention
+            nq = int((self.cfg.n_heads * self.cfg.d_head * self.cfg.d_model)/self.cfg.n_key_value_heads)
+            self._W_K = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
+            self._W_V = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
+        else:
+            self._W_K = nn.Parameter(
+                torch.empty(
+                    cfg.n_key_value_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=cfg.dtype,
+                )
             )
-        )
-        self._W_V = nn.Parameter(
-            torch.empty(
-                cfg.n_key_value_heads,
-                self.cfg.d_model,
-                self.cfg.d_head,
-                dtype=cfg.dtype,
+            self._W_V = nn.Parameter(
+                torch.empty(
+                    cfg.n_key_value_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=cfg.dtype,
+                )
             )
-        )
         self._b_K = nn.Parameter(
             torch.zeros(cfg.n_key_value_heads, self.cfg.d_head, dtype=cfg.dtype)
         )
@@ -55,9 +70,21 @@ class GroupedQueryAttention(AbstractAttention):
             torch.zeros(cfg.n_key_value_heads, self.cfg.d_head, dtype=cfg.dtype)
         )
 
+    def _set_kv_quant_state(self, input: Params4bit, quant_state: QuantState) -> QuantState:
+        quant_state.shape = [quant_state.shape[0]*self.repeat_kv_heads,quant_state.shape[1]]
+        quant_state.absmax = torch.repeat_interleave(
+            quant_state.absmax,
+            dim=0,
+            repeats=self.repeat_kv_heads
+        )
+        return quant_state
+
     @property
     def W_K(self):
-        return torch.repeat_interleave(self._W_K, dim=0, repeats=self.repeat_kv_heads)
+        if self.cfg.load_in_4bit:
+            W_K = Fb.dequantize_4bit(self._W_K, self._W_K.quant_state).to(torch.float16)
+            W_K = einops.rearrange(W_K, "(n h) m->n m h", n=self.cfg.n_key_value_heads)
+        return torch.repeat_interleave(W_K, dim=0, repeats=self.repeat_kv_heads)
 
     @W_K.setter
     def W_K(self, value):
@@ -65,7 +92,10 @@ class GroupedQueryAttention(AbstractAttention):
 
     @property
     def W_V(self):
-        return torch.repeat_interleave(self._W_V, dim=0, repeats=self.repeat_kv_heads)
+        if self.cfg.load_in_4bit:
+            W_V = Fb.dequantize_4bit(self._W_V, self._W_V.quant_state).to(torch.float16)
+            W_V = einops.rearrange(W_V, "(n h) m->n m h", n=self.cfg.n_key_value_heads)
+        return torch.repeat_interleave(W_V, dim=0, repeats=self.repeat_kv_heads)
 
     @W_V.setter
     def W_V(self, value):
@@ -88,19 +118,19 @@ class GroupedQueryAttention(AbstractAttention):
         self._b_V = value
 
     def calculate_qkv_matrices(
-        self,
-        query_input: Union[
-            Float[torch.Tensor, "batch pos d_model"],
-            Float[torch.Tensor, "batch pos head_index d_model"],
-        ],
-        key_input: Union[
-            Float[torch.Tensor, "batch pos d_model"],
-            Float[torch.Tensor, "batch pos kv_head_index d_model"],
-        ],
-        value_input: Union[
-            Float[torch.Tensor, "batch pos d_model"],
-            Float[torch.Tensor, "batch pos kv_head_index d_model"],
-        ],
+            self,
+            query_input: Union[
+                Float[torch.Tensor, "batch pos d_model"],
+                Float[torch.Tensor, "batch pos head_index d_model"],
+            ],
+            key_input: Union[
+                Float[torch.Tensor, "batch pos d_model"],
+                Float[torch.Tensor, "batch pos kv_head_index d_model"],
+            ],
+            value_input: Union[
+                Float[torch.Tensor, "batch pos d_model"],
+                Float[torch.Tensor, "batch pos kv_head_index d_model"],
+            ],
     ) -> Tuple[
         Float[torch.Tensor, "batch pos head_index d_head"],
         Float[torch.Tensor, "batch pos kv_head_index d_head"],
@@ -124,20 +154,52 @@ class GroupedQueryAttention(AbstractAttention):
             else simple_attn_linear
         )
 
-        q = self.hook_q(
-            attn_fn(query_input, self.W_Q, self.b_Q)
-        )  # [batch, pos, head_index, d_head]
-
-        k = self.hook_k(
-            attn_fn(key_input, self.W_K, self.b_K)
-            if self.cfg.ungroup_grouped_query_attention
-            else attn_fn(key_input, self._W_K, self._b_K)
-        )  # [batch, pos, head_index, d_head]
-        v = self.hook_v(
-            attn_fn(value_input, self.W_V, self.b_V)
-            if self.cfg.ungroup_grouped_query_attention
-            else attn_fn(value_input, self._W_V, self._b_V)
-        )  # [batch, pos, head_index, d_head]
+        attn_fn_4bit = (
+            complex_attn_linear_4bit
+            if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
+            else simple_attn_linear_4bit
+        )
+        if self.cfg.load_in_4bit:
+            dequantized_w_q = Fb.dequantize_4bit(self.W_Q, self.W_Q.quant_state).to(query_input.dtype)
+            dequantized_w_q = einops.rearrange(dequantized_w_q, "(n h) m->n m h", n=self.cfg.n_heads)
+            W_Q = nn.Parameter(dequantized_w_q)
+            q = self.hook_q(
+                attn_fn(query_input, W_Q, self.b_Q)
+            )  # [batch, pos, head_index, d_head]
+        else:
+            q = self.hook_q(
+                attn_fn(query_input, self.W_Q, self.b_Q)
+            )  # [batch, pos, head_index, d_head]
+        if self.cfg.load_in_4bit:
+            if self.cfg.ungroup_grouped_query_attention:
+                k = self.hook_k(
+                    attn_fn(key_input, self.W_K, self.b_K)
+                )  # [batch, pos, head_index, d_head]
+            else:
+                k = self.hook_k(
+                    attn_fn(key_input, self._W_K, self._b_K)
+                )  # [batch, pos, head_index, d_head]
+        else:
+            k = self.hook_k(
+                attn_fn(key_input, self.W_K, self.b_K)
+                if self.cfg.ungroup_grouped_query_attention
+                else attn_fn(key_input, self._W_K, self._b_K)
+            )  # [batch, pos, head_index, d_head]
+        if self.cfg.load_in_4bit:
+            if self.cfg.ungroup_grouped_query_attention:
+                v = self.hook_v(
+                    attn_fn(value_input, self.W_V, self.b_V)
+                )  # [batch, pos, head_index, d_head]
+            else:
+                v = self.hook_v(
+                    attn_fn(value_input, self._W_V, self._b_V)
+                )  # [batch, pos, head_index, d_head]
+        else:
+            v = self.hook_v(
+                attn_fn(value_input, self.W_V, self.b_V)
+                if self.cfg.ungroup_grouped_query_attention
+                else attn_fn(value_input, self._W_V, self._b_V)
+            )  # [batch, pos, head_index, d_head]
 
         if self.cfg.use_qk_norm:
             assert self.q_norm is not None

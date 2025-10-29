@@ -20,6 +20,7 @@ from transformer_lens.utils import get_offset_position_ids
 
 if is_bitsandbytes_available():
     import bitsandbytes as bnb
+    import bitsandbytes.functional as Fb
     from bitsandbytes.nn.modules import Params4bit
 
 
@@ -57,6 +58,14 @@ class AbstractAttention(ABC, nn.Module):
             self.W_Q = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
             self.W_O = Params4bit(torch.empty(nq, 1, dtype=torch.uint8), requires_grad=False)
         else:
+            """self.W_Q = nn.Parameter(
+                torch.empty(
+                    self.cfg.n_heads,
+                    self.cfg.d_model,
+                    self.cfg.d_head,
+                    dtype=self.cfg.dtype,
+                )
+            )"""
             self.W_Q = nn.Parameter(
                 torch.empty(
                     self.cfg.n_heads,
@@ -206,7 +215,12 @@ class AbstractAttention(ABC, nn.Module):
         additive_attention_mask is an optional mask to add to the attention weights. Defaults to None.
         attention_mask is the attention mask for padded tokens. Defaults to None.
         """
-
+        if self.cfg.load_in_4bit:
+            dequantized_w_o = Fb.dequantize_4bit(self.W_O, self.W_O.quant_state).to(torch.float16)
+            dequantized_w_o = einops.rearrange(dequantized_w_o, "m (n h)->n h m", n=self.cfg.n_heads)
+            W_O = nn.Parameter(dequantized_w_o)
+        else:
+            W_O = self.W_O
         q, k, v = self.calculate_qkv_matrices(query_input, key_input, value_input)
 
         if past_kv_cache_entry is not None:
@@ -277,59 +291,37 @@ class AbstractAttention(ABC, nn.Module):
         pattern = pattern.to(v.device)
         z = self.calculate_z_scores(v, pattern)  # [batch, pos, head_index, d_head]
         if not self.cfg.use_attn_result:
-            if self.cfg.load_in_4bit:
-                # call bitsandbytes method to dequantize and multiply
-                out = (
-                    bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
-                        self.W_O.t(),
-                        # bias=self.W_O.t(),
-                        bias=None,
-                        quant_state=self.W_O.quant_state,
-                    )
-                    + self.b_O
-                )
-            else:
-                w = einops.rearrange(
-                    self.W_O, "head_index d_head d_model -> d_model (head_index d_head)"
-                )
+            w = einops.rearrange(
+                W_O, "head_index d_head d_model -> d_model (head_index d_head)"
+            )
 
-                if self.b_O.device != w.device:
-                    w = w.to(self.b_O.device)
-                if self.b_O.device != z.device:
-                    z = z.to(self.b_O.device)
+            if self.b_O.device != w.device:
+                w = w.to(self.b_O.device)
+            if self.b_O.device != z.device:
+                z = z.to(self.b_O.device)
 
-                out = F.linear(
-                    z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
-                    w,
-                    self.b_O,
-                )
+            out = F.linear(
+                z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                w,
+                self.b_O,
+            )
         else:
             # Explicitly calculate the attention result so it can be accessed by a hook
             # This is off by default because it can easily eat through your GPU memory.
-            if self.cfg.load_in_4bit:
-                result = self.hook_result(
-                    bnb.matmul_4bit(
-                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
-                        self.W_O.t(),
-                        bias=None,
-                        quant_state=self.W_O.quant_state,
-                    )
-                )
-            else:
-                # Add singleton dimensions to make shapes compatible for broadcasting:
-                w = einops.rearrange(
-                    self.W_O,
-                    "head_index d_head d_model -> 1 1 head_index d_head d_model",
-                )
-                z = einops.rearrange(
-                    z, "batch pos head_index d_head -> batch pos head_index d_head 1"
-                )
 
-                # Multiply the z tensor by the W_O tensor, summing over the d_head dimension
-                unhooked_result = (z * w).sum(-2)
+            # Add singleton dimensions to make shapes compatible for broadcasting:
+            w = einops.rearrange(
+                W_O,
+                "head_index d_head d_model -> 1 1 head_index d_head d_model",
+            )
+            z = einops.rearrange(
+                z, "batch pos head_index d_head -> batch pos head_index d_head 1"
+            )
 
-                result = self.hook_result(unhooked_result)  # [batch, pos, head_index, d_model]
+            # Multiply the z tensor by the W_O tensor, summing over the d_head dimension
+            unhooked_result = (z * w).sum(-2)
+
+            result = self.hook_result(unhooked_result)  # [batch, pos, head_index, d_model]
             out = (
                 einops.reduce(result, "batch position index model->batch position model", "sum")
                 + self.b_O
