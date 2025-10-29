@@ -12,7 +12,7 @@ from transformers.utils import is_bitsandbytes_available
 from transformer_lens.components import AbstractAttention
 from transformer_lens.components.rms_norm import RMSNorm
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
-from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear, complex_attn_linear_4bit, simple_attn_linear_4bit
+from transformer_lens.utilities.attention import complex_attn_linear, simple_attn_linear
 
 if is_bitsandbytes_available():
     import bitsandbytes as bnb
