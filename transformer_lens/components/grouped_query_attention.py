@@ -154,11 +154,7 @@ class GroupedQueryAttention(AbstractAttention):
             else simple_attn_linear
         )
 
-        attn_fn_4bit = (
-            complex_attn_linear_4bit
-            if self.cfg.use_split_qkv_input or self.cfg.use_attn_in
-            else simple_attn_linear_4bit
-        )
+
         if self.cfg.load_in_4bit:
             dequantized_w_q = Fb.dequantize_4bit(self.W_Q, self.W_Q.quant_state).to(query_input.dtype)
             dequantized_w_q = einops.rearrange(dequantized_w_q, "(n h) m->n m h", n=self.cfg.n_heads)
