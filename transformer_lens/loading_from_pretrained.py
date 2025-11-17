@@ -1035,7 +1035,7 @@ def convert_hf_model_config(model_name: str, **kwargs: Any):
             "NTK_by_parts_factor": 8.0,
             "NTK_original_ctx_len": 8192,
         }
-    elif "Llama-3.1-8B" in official_model_name:
+    elif "Llama-3.1-8B" in official_model_name or official_model_name in ["momentino/ama-3.1-8B-Instruct_playpen_SFT_DFINAL_0.7K-steps_merged_full_precision_dialogue_merged_bfloat16", "momentino/n__llama-3.1-8B-Instruct_playpen_SFT_DFINAL_0.7K-steps_merged_full_precision_dialogue_merged4bit", "momentino/clembench-playpen__Llama8B_DPO_turn_solved_merged_bfloat16", "momentino/clembench-playpen__Llama8B_DPO_turn_solved_merged4bit", "momentino/clembench-playpen__llama-3.1-8B-Instruct_playpen_SFT_DFINAL_0.7K-steps_merged_bfloat16", "momentino/clembench-playpen__llama-3.1-8B-Instruct_playpen_SFT_DFINAL_0.7K-steps_merged4bit", "mjs227/grpo-prl-5ep"]:
         cfg_dict = {
             "d_model": 4096,
             "d_head": 128,
