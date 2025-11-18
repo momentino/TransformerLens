@@ -82,7 +82,7 @@ class GroupedQueryAttention(AbstractAttention):
     @property
     def W_K(self):
         if self.cfg.load_in_4bit:
-            W_K = Fb.dequantize_4bit(self._W_K, self._W_K.quant_state).to(self._W_K.quant_state.dtype)
+            W_K = Fb.dequantize_4bit(self._W_K, self._W_K.quant_state).to(torch.float16)
             W_K = einops.rearrange(W_K, "(n h) m->n m h", n=self.cfg.n_key_value_heads)
         else:
             W_K = self._W_K
@@ -95,7 +95,7 @@ class GroupedQueryAttention(AbstractAttention):
     @property
     def W_V(self):
         if self.cfg.load_in_4bit:
-            W_V = Fb.dequantize_4bit(self._W_V, self._W_V.quant_state).to(self._W_V.quant_state.dtype)
+            W_V = Fb.dequantize_4bit(self._W_V, self._W_V.quant_state).to(torch.float16)
             W_V = einops.rearrange(W_V, "(n h) m->n m h", n=self.cfg.n_key_value_heads)
         else:
             W_V = self._W_V
