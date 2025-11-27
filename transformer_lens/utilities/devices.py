@@ -3,166 +3,132 @@
 Utilities to get the correct device, and assist in distributing model layers across multiple
 devices.
 """
-
 from __future__ import annotations
 
-from typing import Optional, Union
-
 import torch
-from torch import nn
-
+import logging
 import transformer_lens
-
-AvailableDeviceMemory = list[tuple[int, int]]
-"""
-This type is passed around between different CUDA memory operations.
-The first entry of each tuple will be the device index.
-The second entry will be how much memory is currently available.
-"""
+from torch import nn
+from typing import Optional, Union, Dict
+from collections import OrderedDict
 
 
-def calculate_available_device_cuda_memory(i: int) -> int:
-    """Calculates how much memory is available at this moment for the device at the indicated index
+logging.basicConfig( level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", force=True)
 
-    Args:
-        i (int): The index we are looking at
+def multi_device_setup(device: Union[str, torch.device, Dict[str, str]]):
+    multi_device = False
+    if isinstance(device, Dict[str, str]) and len(device)>1:
+        multi_device = True
+    return multi_device
 
-    Returns:
-        int: How memory is available
-    """
-    total = torch.cuda.get_device_properties(i).total_memory
-    allocated = torch.cuda.memory_allocated(i)
-    return total - allocated
-
-
-def determine_available_memory_for_available_devices(max_devices: int) -> AvailableDeviceMemory:
-    """Gets all available CUDA devices with their current memory calculated
-
-    Returns:
-        AvailableDeviceMemory: The list of all available devices with memory precalculated
-    """
-    devices = []
-    for i in range(max_devices):
-        devices.append((i, calculate_available_device_cuda_memory(i)))
-
-    return devices
-
-
-def sort_devices_based_on_available_memory(devices: AvailableDeviceMemory) -> AvailableDeviceMemory:
-    """Sorts all available devices with devices with the most available memory returned first
-
-    Args:
-        devices (AvailableDeviceMemory): All available devices with memory calculated
-
-    Returns:
-        AvailableDeviceMemory: The same list of passed through devices sorted with devices with most
-        available memory first
-    """
+def get_sorted_available_gpus(devices : Optional[List[str]] = None):
+    if devices is None:
+        devices = []
+        for i in range(torch.cuda.device_count()):
+            device_name = f'cuda:{i}'
+            free, total = torch.cuda.mem_get_info(device=device_name)
+            devices.append((device_name, free))
+    else:
+        for d in devices:
+            free, total = torch.cuda.mem_get_info(device=device_name)
+            d = (d, free)
     return sorted(devices, key=lambda x: x[1], reverse=True)
 
+def estimate_model_size(cfg: HookedTransformerConfig):
+    overhead_multiplier = 1.2
 
-def get_best_available_cuda_device(max_devices: Optional[int] = None) -> torch.device:
-    """Gets whichever cuda device has the most available amount of memory for use
+    bytes_by_dtype = {
+        torch.uint8: 1,
+        torch.float16: 2,
+        torch.bfloat16: 2,
+        torch.float32: 4
+    }
+    bytes = bytes_by_dtype[cfg['dtype']]
+    embed_layer_p_num = cfg['d_vocab']*cfg['d_model'] # [d_vocab, d_model]
 
-    Raises:
-        EnvironmentError: If there are no available devices, this will error out
+    w_q_k_v_p_num = cfg['d_model']*cfg['n_heads']*cfg['d_head']
+    b_q_k_v_p_num = cfg['n_heads']*cfg['d_head']
+    w_o_p_num = cfg['n_heads']*cfg['d_head']*cfg['d_model']
+    b_o_p_num = cfg['d_model']
+    w_gate_p_num = cfg['d_model']*cfg['d_mlp']
+    w_in_p_num = cfg['d_model']*cfg['d_mlp']
+    b_in_p_num = cfg['d_mlp']
+    w_out_p_num = cfg['d_mlp']*cfg['d_model']
+    b_out_p_num = cfg['d_model']
+    single_transformer_block_p_num = ((w_q_k_v_p_num*3) + (b_q_k_v_p_num*3) + w_o_p_num + b_o_p_num + w_gate_p_num + w_in_p_num + b_in_p_num + w_out_p_num + b_out_p_num)
+    total_transformer_blocks_p_num = cfg['n_layers']*single_transformer_block_p_num
 
-    Returns:
-        torch.device: The specific device that should be used
-    """
-    max_devices = max_devices if max_devices is not None else torch.cuda.device_count()
-    devices = determine_available_memory_for_available_devices(max_devices)
+    unembed_p_num = cfg['d_vocab']*cfg['d_model'] # [d_model, d_vocab]
+    ln_final_p_num = cfg['d_model']
+    b_unembed_p_num = cfg['d_vocab']
 
-    if len(devices) <= 0:
-        raise EnvironmentError(
-            "TransformerLens has been configured to use CUDA, but no available devices are present"
+    total_p_num = embed_layer_p_num + total_transformer_blocks_p_num + unembed_p_num + ln_final_p_num + b_unembed_p_num
+    total_size = total_p_num*bytes*overhead_multiplier
+    module_map_with_size = OrderedDict([
+        ('embed', embed_layer_p_num*bytes*1.2)])
+    for l in range(cfg['n_layers']):
+        module_map_with_size.update(
+            {f'blocks.{l}': single_transformer_block_p_num*bytes*overhead_multiplier}
         )
+    module_map_with_size.update({
+        'ln_final': ln_final_p_num,
+        'unembed': (unembed_p_num + b_unembed_p_num)*bytes*overhead_multiplier})
+    return total_size, module_map_with_size
 
-    sorted_devices = sort_devices_based_on_available_memory(devices=devices)
+def expand_device_map(device_map: Union[str, torch.device, Dict[str, str]], cfg: Dict):
+    """ For now, we won't split the components of a layer across GPUs, but just split whole layers. """
+    blocks = []
+    expanded_device_map = OrderedDict()
+    blocks.append('embed')
+    blocks.extend([f'blocks.{i}' for i in range(cfg['n_layers'])])
+    blocks.append('ln_final')
+    blocks.append('unembed')
+    devices = []
+    if isinstance(device_map, str):
+        if device_map in ['auto', 'balanced_low_0']:
+            devices = get_sorted_available_gpus()
+        elif 'cuda' in device_map or 'cpu' in device_map:
+            devices = [device_map]
+    elif isinstance(device_map, Dict):
+        for device_id, device_name in device_map.items():
+            devices.append(device_name)
+        devices = get_sorted_available_gpus(devices)
 
-    return torch.device("cuda", sorted_devices[0][0])
+    if len(devices)>1 and 'cpu' in devices:
+        if not torch.cuda.is_available():
+            logging.warning('CUDA is not available on the machine. Since the device_map includes the CPU, we will load the model entirely into this device.')
+            devices = 'cpu'
+    logging.info(f"Available devices on the machine with their avialable memory: {devices}")
 
+    estimated_model_size, module_map_with_size = estimate_model_size(cfg)
 
-def get_best_available_device(cfg: "transformer_lens.HookedTransformerConfig") -> torch.device:
-    """Gets the best available device to be used based on the passed in arguments
-
-    Args:
-        device (Union[torch.device, str]): Either the existing torch device or the string identifier
-
-    Returns:
-        torch.device: The best available device
-    """
-    assert cfg.device is not None
-    device = torch.device(cfg.device)
-
-    if device.type == "cuda" and cfg.n_devices > 1:
-        return get_best_available_cuda_device(cfg.n_devices)
+    if len(devices)>1:
+        cuda_devices = [d for d in devices if 'cuda' in d[0]]
+        mem_allocated_on_current_device = 0
+        if device_map == 'auto':
+            device_memory_threshold = estimated_model_size/len(cuda_devices)
+            device_cursor = 0
+            for b in blocks:
+                if mem_allocated_on_current_device <= device_memory_threshold:
+                    mem_allocated_on_current_device += module_map_with_size[b]
+                else:
+                    mem_allocated_on_current_device = module_map_with_size[b]
+                    device_cursor = device_cursor + 1
+                expanded_device_map[b] = cuda_devices[device_cursor][0]
+        elif device_map == 'balanced_low_0':
+            device_cursor = len(cuda_devices) - 1
+            for b in range(blocks, 0, -1):
+                current_device_memory = cuda_devices[device_cursor][1]
+                if mem_allocated_on_current_device < current_device_memory:
+                    expanded_device_map[b] = cuda_devices[device_cursor][0]
+                    mem_allocated_on_current_device += module_map_with_size[b]
+                else:
+                    mem_allocated_on_current_device = 0
+                    device_cursor = device_cursor -1
+            # In case we didn't get to put something inside our first GPU during the split, we can actually use if completely for the data.
+            if device_cursor > 0:
+                expanded_device_map['embed'] = cuda_devices[0][0]
     else:
-        return device
-
-
-def get_device_for_block_index(
-    index: int,
-    cfg: "transformer_lens.HookedTransformerConfig",
-    device: Optional[Union[torch.device, str]] = None,
-):
-    """
-    Determine the device for a given layer index based on the model configuration.
-
-    This function assists in distributing model layers across multiple devices. The distribution
-    is based on the configuration's number of layers (cfg.n_layers) and devices (cfg.n_devices).
-
-
-    Args:
-        index (int): Model layer index.
-        cfg (HookedTransformerConfig): Model and device configuration.
-        device (Optional[Union[torch.device, str]], optional): Initial device used for determining the target device.
-            If not provided, the function uses the device specified in the configuration (cfg.device).
-
-    Returns:
-        torch.device: The device for the specified layer index.
-
-    Deprecated:
-        This function did not take into account a few factors for multi-GPU support. You should now
-        use get_best_available_device in order to properly run models on multiple devices.
-        This will be removed in 3.0
-    """
-    assert cfg.device is not None
-    layers_per_device = cfg.n_layers // cfg.n_devices
-    if device is None:
-        device = cfg.device
-    device = torch.device(device)
-    if device.type == "cpu":
-        return device
-    device_index = (device.index or 0) + (index // layers_per_device)
-    return torch.device(device.type, device_index)
-
-
-def move_to_and_update_config(
-    model: Union[
-        "transformer_lens.HookedTransformer",
-        "transformer_lens.HookedEncoder",
-        "transformer_lens.HookedEncoderDecoder",
-    ],
-    device_or_dtype: Union[torch.device, str, torch.dtype],
-    print_details=True,
-):
-    """
-    Wrapper around `to` that also updates `model.cfg`.
-    """
-    if isinstance(device_or_dtype, torch.device):
-        model.cfg.device = device_or_dtype.type
-        if print_details:
-            print("Moving model to device: ", model.cfg.device)
-    elif isinstance(device_or_dtype, str):
-        model.cfg.device = device_or_dtype
-        if print_details:
-            print("Moving model to device: ", model.cfg.device)
-    elif isinstance(device_or_dtype, torch.dtype):
-        model.cfg.dtype = device_or_dtype
-        if print_details:
-            print("Changing model dtype to", device_or_dtype)
-        # change state_dict dtypes
-        for k, v in model.state_dict().items():
-            model.state_dict()[k] = v.to(device_or_dtype)
-    return nn.Module.to(model, device_or_dtype)
+        for b in blocks:
+            expanded_device_map[b] = devices[0]
+    return expanded_device_map

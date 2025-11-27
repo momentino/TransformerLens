@@ -117,7 +117,6 @@ class HookedTransformer(HookedRootModule):
         self,
         cfg: Union[HookedTransformerConfig, Dict],
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
-        move_to_device: bool = True,
         default_padding_side: Literal["left", "right"] = "right",
     ):
         """Model initialization.
@@ -220,12 +219,12 @@ class HookedTransformer(HookedRootModule):
         if self.cfg.init_weights:
             self.init_weights()
 
-        if move_to_device:
+        """if move_to_device:
             # We load the devices in a pipeline manner - the first device gets the embed and
             # pos_embed layers and the first n_layers // n_devices blocks, the second gets the next
             # n_layers // n_devices blocks ... the last gets the last n_layers // n_devices blocks,
             # the final normalization layer (if it exists) and the unembed layer
-            self.move_model_modules_to_device()
+            self.move_model_modules_to_device()"""
 
         # Helper variable to store a small (10K-20K) dataset of training data. Empty by default, can
         # be loaded with load_sample_training_dataset
@@ -290,14 +289,13 @@ class HookedTransformer(HookedRootModule):
         self,
         embed,
         pos_offset,
+        device,
         prepend_bos=USE_DEFAULT_VALUE,
         attention_mask=None,
         tokens=None,
         return_shortformer_pos_embed=True,
-        device=None,
+
     ):
-        if device is None:
-            device = devices.get_device_for_block_index(0, self.cfg)
 
         if tokens is None:
             # Because tokens only need for defining batch size and sequence length, we can simply synthesize them
@@ -375,8 +373,7 @@ class HookedTransformer(HookedRootModule):
         if len(tokens.shape) == 1:
             # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
             tokens = tokens[None]
-        if tokens.device.type != self.cfg.device:
-            tokens = tokens.to(devices.get_device_for_block_index(0, self.cfg))
+        tokens = tokens.to(self.cfg.device_map['embed'])
 
         if (
             (self.tokenizer and self.tokenizer.padding_side == "left")
@@ -398,7 +395,7 @@ class HookedTransformer(HookedRootModule):
                 f"Attention mask shape {attention_mask.shape} does not match tokens shape "
                 f"{tokens.shape}"
             )
-            attention_mask = attention_mask.to(devices.get_device_for_block_index(0, self.cfg))
+            attention_mask = attention_mask.to(self.cfg.device_map['embed'])
             if past_kv_cache is not None:
                 # past_kv_cache is not None, so we're doing caching.
                 # We need to extend the previous attention_mask.
@@ -418,6 +415,7 @@ class HookedTransformer(HookedRootModule):
         residual, shortformer_pos_embed = self.get_residual(
             embed,
             pos_offset,
+            self.cfg.device_map['embed'],
             prepend_bos,
             attention_mask,
             tokens,
@@ -611,10 +609,10 @@ class HookedTransformer(HookedRootModule):
                 # Note that each block includes skip connections, so we don't need
                 # residual + block(residual)
                 # If we're using multiple GPUs, we need to send the residual and shortformer_pos_embed to the correct GPU
-                residual = residual.to(devices.get_device_for_block_index(i, self.cfg))
+                residual = residual.to(self.cfg.device_map[f'blocks.{i}'])
                 if shortformer_pos_embed is not None:
                     shortformer_pos_embed = shortformer_pos_embed.to(
-                        devices.get_device_for_block_index(i, self.cfg)
+                        self.cfg.device_map[f'blocks.{i}']
                     )
 
                 residual = block(

@@ -225,8 +225,7 @@ class HookedTransformerConfig:
     attn_types: Optional[List] = None
     init_mode: str = "gpt2"
     normalization_type: Optional[str] = "LN"
-    device: Optional[str] = None
-    n_devices: int = 1
+    device_map: Optional[Union[str, torch.device, Dict[str, str]]] = None,
     attention_dir: str = "causal"
     attn_only: bool = False
     seed: Optional[int] = None
@@ -328,13 +327,8 @@ class HookedTransformerConfig:
                 mlp_params_per_layer = (mlp_params_per_layer + self.d_model) * self.num_experts
             self.n_params += self.n_layers * mlp_params_per_layer
 
-        if self.device is None:
-            self.device = utils.get_device()
-
-        if self.n_devices > 1:
-            assert (
-                torch.cuda.device_count() >= self.n_devices
-            ), f"Not enough CUDA devices to support n_devices {self.n_devices}"
+        if self.device_map is None:
+            self.device_map = utils.get_device()
 
         if self.use_attn_scale and self.attn_scale == -1.0:
             self.attn_scale = np.sqrt(self.d_head)

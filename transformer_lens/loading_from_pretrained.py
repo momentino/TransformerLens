@@ -22,6 +22,7 @@ from transformers import (
 )
 
 import transformer_lens.utils as utils
+from transformer_lens.utilities.devices import expand_device_map
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 from transformer_lens.pretrained.weight_conversions import (
     convert_bert_weights,
@@ -1638,8 +1639,7 @@ def get_pretrained_model_config(
     checkpoint_index: Optional[int] = None,
     checkpoint_value: Optional[int] = None,
     fold_ln: bool = False,
-    device: Optional[Union[str, torch.device]] = None,
-    n_devices: int = 1,
+    device_map: Optional[Union[str, torch.device, Dict[str, str]]] = None,
     default_prepend_bos: Optional[bool] = None,
     dtype: torch.dtype = torch.float32,
     first_n_layers: Optional[int] = None,
@@ -1722,8 +1722,6 @@ def get_pretrained_model_config(
         )
         fold_ln = False
 
-    if device is not None:
-        cfg_dict["device"] = device
 
     cfg_dict["dtype"] = dtype
 
@@ -1754,9 +1752,6 @@ def get_pretrained_model_config(
     else:
         cfg_dict["from_checkpoint"] = False
 
-    cfg_dict["device"] = device
-    cfg_dict["n_devices"] = n_devices
-
     if default_prepend_bos is not None:
         # User explicitly set prepend_bos behavior, override config/default value
         cfg_dict["default_prepend_bos"] = default_prepend_bos
@@ -1771,6 +1766,9 @@ def get_pretrained_model_config(
             cfg_dict["rotary_base"] = hf_cfg.get("rope_theta", cfg_dict["rotary_base"])
     if first_n_layers is not None:
         cfg_dict["n_layers"] = first_n_layers
+
+    if device_map is not None:
+        cfg_dict["device_map"] = expand_device_map(device_map, cfg_dict)
 
     cfg = HookedTransformerConfig.from_dict(cfg_dict)
     return cfg
