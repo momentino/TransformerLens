@@ -29,9 +29,10 @@ def get_sorted_available_gpus(devices : Optional[List[str]] = None):
             free, total = torch.cuda.mem_get_info(device=device_name)
             devices.append((device_name, free))
     else:
-        for d in devices:
+        for i,d in enumerate(devices):
+            device_name = d
             free, total = torch.cuda.mem_get_info(device=device_name)
-            d = (d, free)
+            devices[i] = (d, free)
     return sorted(devices, key=lambda x: x[1], reverse=True)
 
 def estimate_model_size(cfg: HookedTransformerConfig):
@@ -88,7 +89,7 @@ def expand_device_map(device_map: Union[str, torch.device, Dict[str, str]], cfg:
         if device_map in ['auto', 'balanced_low_0']:
             devices = get_sorted_available_gpus()
         elif 'cuda' in device_map or 'cpu' in device_map:
-            devices = [device_map]
+            devices = get_sorted_available_gpus([device_map])
     elif isinstance(device_map, Dict):
         for device_id, device_name in device_map.items():
             devices.append(device_name)
@@ -98,37 +99,36 @@ def expand_device_map(device_map: Union[str, torch.device, Dict[str, str]], cfg:
         if not torch.cuda.is_available():
             logging.warning('CUDA is not available on the machine. Since the device_map includes the CPU, we will load the model entirely into this device.')
             devices = 'cpu'
-    logging.info(f"Available devices on the machine with their avialable memory: {devices}")
+    logging.info(f"Available devices with their memory: {devices}")
 
     estimated_model_size, module_map_with_size = estimate_model_size(cfg)
 
-    if len(devices)>1:
-        cuda_devices = [d for d in devices if 'cuda' in d[0]]
-        mem_allocated_on_current_device = 0
-        if device_map == 'auto':
-            device_memory_threshold = estimated_model_size/len(cuda_devices)
-            device_cursor = 0
-            for b in blocks:
-                if mem_allocated_on_current_device <= device_memory_threshold:
-                    mem_allocated_on_current_device += module_map_with_size[b]
-                else:
-                    mem_allocated_on_current_device = module_map_with_size[b]
-                    device_cursor = device_cursor + 1
+    cuda_devices = [d for d in devices if 'cuda' in d[0]]
+    mem_allocated_on_current_device = 0
+    if device_map == 'auto':
+        device_memory_threshold = estimated_model_size/len(cuda_devices)
+        device_cursor = 0
+        for b in blocks:
+            if mem_allocated_on_current_device <= device_memory_threshold:
+                mem_allocated_on_current_device += module_map_with_size[b]
+            else:
+                mem_allocated_on_current_device = module_map_with_size[b]
+                device_cursor = device_cursor + 1
+            expanded_device_map[b] = cuda_devices[device_cursor][0]
+    elif device_map == 'balanced_low_0':
+        device_cursor = len(cuda_devices) - 1
+        for b in range(blocks, 0, -1):
+            current_device_memory = cuda_devices[device_cursor][1]
+            if mem_allocated_on_current_device < current_device_memory:
                 expanded_device_map[b] = cuda_devices[device_cursor][0]
-        elif device_map == 'balanced_low_0':
-            device_cursor = len(cuda_devices) - 1
-            for b in range(blocks, 0, -1):
-                current_device_memory = cuda_devices[device_cursor][1]
-                if mem_allocated_on_current_device < current_device_memory:
-                    expanded_device_map[b] = cuda_devices[device_cursor][0]
-                    mem_allocated_on_current_device += module_map_with_size[b]
-                else:
-                    mem_allocated_on_current_device = 0
-                    device_cursor = device_cursor -1
-            # In case we didn't get to put something inside our first GPU during the split, we can actually use if completely for the data.
-            if device_cursor > 0:
-                expanded_device_map['embed'] = cuda_devices[0][0]
+                mem_allocated_on_current_device += module_map_with_size[b]
+            else:
+                mem_allocated_on_current_device = 0
+                device_cursor = device_cursor -1
+        # In case we didn't get to put something inside our first GPU during the split, we can actually use if completely for the data.
+        if device_cursor > 0:
+            expanded_device_map['embed'] = cuda_devices[0][0]
     else:
         for b in blocks:
-            expanded_device_map[b] = devices[0]
+            expanded_device_map[b] = devices[0][0]
     return expanded_device_map
